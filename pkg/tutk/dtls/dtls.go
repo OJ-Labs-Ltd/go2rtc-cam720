@@ -62,14 +62,10 @@ func buildDTLSConfig(psk []byte, isServer bool) *dtls.Config {
 		InsecureSkipVerifyHello: true,
 		MTU:                     1200,
 		FlightInterval:          300 * time.Millisecond,
-		ExtendedMasterSecret:    dtls.DisableExtendedMasterSecret,
+		ExtendedMasterSecret:    dtls.RequestExtendedMasterSecret,
 	}
 
-	if isServer {
-		config.CipherSuites = []dtls.CipherSuiteID{dtls.TLS_PSK_WITH_AES_128_CBC_SHA256}
-	} else {
-		config.CustomCipherSuites = CustomCipherSuites
-	}
+	config.CipherSuites = []dtls.CipherSuiteID{dtls.TLS_PSK_WITH_AES_128_CBC_SHA256}
 
 	return config
 }

@@ -45,6 +45,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/webrtc"
 	"github.com/AlexxIT/go2rtc/internal/webtorrent"
 	"github.com/AlexxIT/go2rtc/internal/wyoming"
+	"github.com/AlexxIT/go2rtc/internal/cam720"
 	"github.com/AlexxIT/go2rtc/internal/wyze"
 	"github.com/AlexxIT/go2rtc/internal/xiaomi"
 	"github.com/AlexxIT/go2rtc/internal/yandex"
@@ -105,6 +106,7 @@ func main() {
 		{"roborock", roborock.Init},
 		{"tapo", tapo.Init},
 		{"tuya", tuya.Init},
+		{"cam720", cam720.Init},
 		{"wyze", wyze.Init},
 		{"xiaomi", xiaomi.Init},
 		{"yandex", yandex.Init},

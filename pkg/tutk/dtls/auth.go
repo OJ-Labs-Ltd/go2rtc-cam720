@@ -16,20 +16,15 @@ func CalculateAuthKey(enr, mac string) []byte {
 	return []byte(b64)
 }
 
-func DerivePSK(enr string) []byte {
-	// DerivePSK derives the DTLS PSK from ENR
-	// TUTK SDK treats the PSK as a NULL-terminated C string, so if SHA256(ENR)
-	// contains a 0x00 byte, the PSK is truncated at that position.
-	hash := sha256.Sum256([]byte(enr))
-	pskLen := 32
+// DerivePSK: PSK = SHA256(input), truncate at first NULL (TUTK3rdSHA256 convention).
+// For CAM720: input is the P2P auth key set via /goform/setAPLanP2PAuthkey.
+func DerivePSK(input string) []byte {
+	hash := sha256.Sum256([]byte(input))
+	n := 32
 	for i := range 32 {
-		if hash[i] == 0x00 {
-			pskLen = i
-			break
-		}
+		if hash[i] == 0x00 { n = i; break }
 	}
-
 	psk := make([]byte, 32)
-	copy(psk[:pskLen], hash[:pskLen])
+	copy(psk[:n], hash[:n])
 	return psk
 }

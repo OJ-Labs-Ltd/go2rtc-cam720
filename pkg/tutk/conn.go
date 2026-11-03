@@ -1,6 +1,8 @@
 package tutk
 
 import (
+	"log"
+	"os"
 	"fmt"
 	"io"
 	"net"
@@ -82,14 +84,14 @@ func (c *Conn) Read(buf []byte) (n int, err error) {
 		}
 
 		ReverseTransCodePartial(buf, buf[:n])
-		//log.Printf("<- %x", buf[:n])
+		if os.Getenv("TUTK_DEBUG") != "" { log.Printf("<- %x", buf[:n]) }
 		return n, nil
 	}
 }
 
 // Write overwrite net.Conn
 func (c *Conn) Write(b []byte) (n int, err error) {
-	//log.Printf("-> %x", b)
+	if os.Getenv("TUTK_DEBUG") != "" { log.Printf("-> %x", b) }
 	return c.UDPConn.WriteToUDP(TransCodePartial(nil, b), c.addr)
 }
 

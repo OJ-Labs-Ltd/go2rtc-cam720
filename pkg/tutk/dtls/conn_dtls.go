@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -226,6 +227,57 @@ func (c *DTLSConn) AVClientStart(timeout time.Duration) error {
 	}
 }
 
+// AVClientStartCh1 is the firmware-correct talk-back path. Camera's firmware
+// at FUN_00421c54 (= IPC_AVServStartCH0_Thread) calls avServStartEx on BOTH
+// ch0 AND ch1 with "PSK-AES128-CBC-SHA256" — meaning the camera is a DTLS
+// SERVER waiting for the client on both channels. For talk-back we need to be
+// the DTLS CLIENT on ch1 (and then do AV login on it), not a server listening
+// for the camera. Audio frames then go through ch1's clientConn as raw IOTC.
+func (c *DTLSConn) AVClientStartCh1(timeout time.Duration) error {
+	conn, err := NewDTLSClient(c.ctx, iotcChannelBack, c.addr, c.WriteDTLS, c.serverBuf, c.psk)
+	if err != nil {
+		return fmt.Errorf("dtls: ch1 client handshake failed: %w", err)
+	}
+	if c.verbose {
+		fmt.Printf("[DTLS] CH1 client handshake complete\n")
+	}
+
+	// AV login handshake on ch1, same as ch0's AVClientStart.
+	randomID := tutk.GenSessionID()
+	pkt1 := c.msgAVLogin(magicAVLogin1, 570, 0x0001, randomID)
+	pkt2 := c.msgAVLogin(magicAVLogin2, 572, 0x0000, randomID)
+	pkt2[20]++
+
+	if _, err := conn.Write(pkt1); err != nil {
+		go conn.Close()
+		return fmt.Errorf("ch1 av login 1: %w", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if _, err := conn.Write(pkt2); err != nil {
+		go conn.Close()
+		return fmt.Errorf("ch1 av login 2: %w", err)
+	}
+
+	buf := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	n, err := conn.Read(buf)
+	if err != nil {
+		go conn.Close()
+		return fmt.Errorf("ch1 read av login resp: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+	if c.verbose {
+		fmt.Printf("[CH1] AV Login response %d bytes:\n%s", n, hexDump(buf[:n]))
+	}
+	ack := c.msgACK()
+	conn.Write(ack)
+
+	c.mu.Lock()
+	c.serverConn = conn
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *DTLSConn) AVServStart() error {
 	conn, err := NewDTLSServer(c.ctx, iotcChannelBack, c.addr, c.WriteDTLS, c.serverBuf, c.psk)
 	if err != nil {
@@ -324,6 +376,24 @@ func (c *DTLSConn) AVRecvFrameData() (*tutk.Packet, error) {
 	}
 }
 
+// AVSendAudioDataCh0 writes a raw IOTC audio frame to the main AV channel
+// (clientConn, CH0). IPC_Media_SpeakerThread in the firmware reads from
+// session+0x4 which is the main avIndex, so audio frames routed to CH0 land
+// on the queue the speaker thread drains. Use this (not AVSendAudioData)
+// when CH1 is NOT the right destination.
+func (c *DTLSConn) AVSendAudioDataCh0(codec byte, payload []byte, timestampUS uint32, sampleRate uint32, channels uint8) error {
+	c.mu.Lock()
+	conn := c.clientConn
+	if conn == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("client conn not ready")
+	}
+	frame := c.msgAudioFrame(payload, timestampUS, codec, sampleRate, channels)
+	c.mu.Unlock()
+	_, err := conn.Write(frame)
+	return err
+}
+
 func (c *DTLSConn) AVSendAudioData(codec byte, payload []byte, timestampUS uint32, sampleRate uint32, channels uint8) error {
 	c.mu.Lock()
 	conn := c.serverConn
@@ -332,7 +402,7 @@ func (c *DTLSConn) AVSendAudioData(codec byte, payload []byte, timestampUS uint3
 		return fmt.Errorf("av server not ready")
 	}
 
-	frame := c.msgAudioFrame(payload, timestampUS, codec, sampleRate, channels)
+	frame := c.msgAudioFrameLegacy(payload, timestampUS, codec, sampleRate, channels)
 
 	c.mu.Unlock()
 
@@ -368,7 +438,164 @@ func (c *DTLSConn) WriteDTLS(payload []byte, channel byte) error {
 }
 
 func (c *DTLSConn) WriteIOCtrl(payload []byte) error {
-	_, err := c.conn.Write(c.msgIOCtrl(payload))
+	// Must go through the DTLS tunnel; writing to the raw UDPConn would need a
+	// dialed socket, which we don't have (we ListenUDP for discovery).
+	_, err := c.clientConn.Write(c.msgIOCtrl(payload))
+	return err
+}
+
+// WriteIOCtrlStd sends a standard IOCtrl in the CAM720 DTLS AV format.
+func (c *DTLSConn) WriteIOCtrlStd(ctrlType uint32, ctrlData []byte) error {
+	c.mu.Lock()
+	conn := c.clientConn
+	if conn == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("client conn not ready")
+	}
+	b := c.msgCAM720IOCtrl(ctrlType, ctrlData)
+	c.mu.Unlock()
+	_, err := conn.Write(b)
+	return err
+}
+
+// RecvIOCtrlRaw pulls one raw IOCtrl command the worker has queued, with a
+// timeout. Returns (ctrlType, body, err) parsed out of the standard IOCtrl
+// wrapper (magic 0x1000, 36 bytes total, 4-byte ctrlType at offset 28).
+func (c *DTLSConn) RecvIOCtrlRaw(timeout time.Duration) (uint32, []byte, error) {
+	select {
+	case data, ok := <-c.rawCmd:
+		if !ok { return 0, nil, fmt.Errorf("closed") }
+		if len(data) < 32 { return 0, nil, fmt.Errorf("short %d", len(data)) }
+		ct := binary.LittleEndian.Uint32(data[28:])
+		return ct, data[32:], nil
+	case <-time.After(timeout):
+		return 0, nil, fmt.Errorf("timeout")
+	}
+}
+
+// OpenAudioChannelCAM720 opens TUTK channel 1 (two-way audio) by sending the
+// Session16 ClientStart message with device credentials, over the DTLS tunnel.
+// Equivalent to avServStartEx in the Jooan Android app's ThreadSendAudio
+// (jadx w.java). Must be called once after AVClientStart and before any
+// SendAudioCAM720 so the camera routes those frames to the speaker instead
+// of dropping them.
+func (c *DTLSConn) OpenAudioChannelCAM720(username, password string) error {
+	// Build the ClientStart message (598 bytes) exactly as Session16 does.
+	const size = 566 + 32
+	b := make([]byte, size)
+
+	// 28-byte Session wrapper
+	copy(b, []byte{0x04, 0x02, 0x1d, 0x0a})
+	binary.LittleEndian.PutUint16(b[4:], uint16(size-16))
+	copy(b[8:], []byte{0x07, 0x04, 0x21, 0x00})
+	copy(b[12:14], c.sid[:2])
+	b[14] = 1 // channel 1 (audio)
+	b[16] = 0x0c
+	copy(b[20:28], c.sid)
+
+	// 24-byte cmd header
+	cmd := b[28:]
+	copy(cmd, []byte{0x00, 0x00, 0x0b, 0x00})
+	binary.LittleEndian.PutUint16(cmd[16:], uint16(size-52))
+	cmd[18] = 1
+	binary.LittleEndian.PutUint32(cmd[20:], uint32(time.Now().UnixMilli()))
+
+	// data region: username (56 bytes) at offset 0, password at 56+256=312, trailer at 538
+	data := cmd[24:]
+	copy(data, []byte(username))
+	copy(data[56+256+1:], []byte(password))
+	// trailer at offset 538 (32 bytes): some version/caps fingerprint
+	copy(data[538:], []byte{0x01, 0, 0, 0, 0x04, 0, 0, 0, 0xfb, 0x07, 0x1f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0, 0, 0, 0x01, 0, 0, 0})
+
+	_, err := c.clientConn.Write(b)
+	return err
+}
+
+// OpenSpeakerCAM720WithChan sends the captured speaker-start IOCtrl 848.
+// The iPhone passes 1 in this payload while transmitting audio on IOTC channel
+// 0. This field must not be used to select the DTLS transport channel.
+func (c *DTLSConn) OpenSpeakerCAM720WithChan(serverCh uint32) error {
+	body := make([]byte, 8)
+	binary.LittleEndian.PutUint32(body, serverCh)
+	c.mu.Lock()
+	c.audioFrameNo = 0
+	c.mu.Unlock()
+	return c.WriteIOCtrlStd(848, body)
+}
+func (c *DTLSConn) OpenSpeakerCAM720() error { return c.OpenSpeakerCAM720WithChan(1) }
+
+func (c *DTLSConn) CloseSpeakerCAM720() error {
+	return c.WriteIOCtrlStd(849, []byte{1, 0, 0, 0})
+}
+
+// SendAudioCAM720 sends one PCM/G.711 chunk to the camera's speaker using
+// the Session16 "SendFrameData" layout observed in the Android app:
+//   - 28-byte msgHhr
+//   - 24-byte cmd header (01 03 0b 00 || seq || mediaSize || 00 00 || 2800 ||
+//     dataSize || tsLE16 || 01 00 00 00)
+//   - payload (len = len(pcm))
+//   - "ODUA\x20\x00\x00\x00"
+//   - 16-byte frameInfo = parseFrameInfo(codecId, flags, 0, 0, tsMS)
+// codecID is the TUTK codec id (e.g. 0x8A for G.711 μ-law, 0x8B for G.711 A-law,
+// 0x8C for PCM 16-bit). flags byte = channelCfg | (srIdx<<2) | (dataBits<<1):
+//   mono=0, 8kHz srIdx=0, 16bit dataBits=1 → flags=0x02.
+//   16kHz srIdx=2 → flags=0x0A.
+// prefixFrameInfo: when true, frameInfo (16B) is written BEFORE the PCM payload,
+// following the ThroughTek convention `avSendAudioData` native uses on many
+// vendors (frame_info || pcm). When false, we use the Session16 reference
+// layout (pcm || "ODUA\x20\x00\x00\x00" || frameInfo). Set via SendAudioCAM720Mode.
+var prefixFrameInfo = false
+
+// SendAudioCAM720Mode switches the frame layout for subsequent SendAudioCAM720
+// calls. "prefix" places the 16-byte frameInfo before the PCM; any other value
+// uses the Session16 trailer layout.
+func (c *DTLSConn) SendAudioCAM720Mode(m string) { prefixFrameInfo = (m == "prefix") }
+
+func (c *DTLSConn) SendAudioCAM720(codecID uint16, flags byte, pcm []byte) error {
+	c.audioFrameNo++
+	n := uint16(len(pcm))
+	// The TUTK frame builder (firmware FUN_00627f84) lays the trailer out as
+	//   "ODUA" (4) | frameInfoLen uint32-LE (4) | frameInfo (frameInfoLen)
+	// go2rtc's SendFrameData hardcodes frameInfoLen = 0x20 (32), which is the
+	// VIDEO frameInfo size. avRecvAudioData reads a 16-byte frameInfo, so the
+	// AUDIO trailer must declare 0x10 (16): dataSize = n + 8 + 16.
+	const fiLen = 16
+	dataSize := n + 8 + fiLen
+	total := 28 + 24 + int(dataSize)
+	b := make([]byte, total)
+
+	// 28-byte Session wrapper
+	copy(b, []byte{0x04, 0x02, 0x1d, 0x0a})
+	binary.LittleEndian.PutUint16(b[4:], uint16(total-16))
+	copy(b[8:], []byte{0x07, 0x04, 0x21, 0x00})
+	copy(b[12:14], c.sid[:2])
+	b[16] = 0x0c
+	copy(b[20:28], c.sid)
+
+	// 24-byte cmd header (frame-data variant), byte1=0x03 = audio channel
+	cmd := b[28:]
+	copy(cmd, []byte{0x01, 0x03, 0x0b, 0x00})
+	c.audioSeq++
+	binary.LittleEndian.PutUint16(cmd[4:], uint16(c.audioSeq))
+	binary.LittleEndian.PutUint16(cmd[8:], n)
+	// hdrSize = ODUA(8) + frameInfo(fiLen). SessionRead expects
+	// hdrSize + payloadSize bytes total; declaring 0x28 (video's 40)
+	// when we only ship 24 leaves the camera's chunk reassembler stuck.
+	cmd[14] = byte(8 + fiLen) // 0x18 for audio
+	binary.LittleEndian.PutUint16(cmd[16:], dataSize)
+	binary.LittleEndian.PutUint16(cmd[18:], uint16(time.Now().UnixMilli()))
+	cmd[20] = 1
+
+	data := cmd[24:]
+	copy(data, pcm)
+	// "ODUA" + frameInfoLen(16) little-endian
+	copy(data[n:], []byte{'O', 'D', 'U', 'A', fiLen, 0x00, 0x00, 0x00})
+	fi := data[n+8:] // 16-byte frameInfo
+	binary.LittleEndian.PutUint16(fi[0:], codecID)
+	fi[2] = flags
+	binary.LittleEndian.PutUint32(fi[12:], uint32(time.Now().UnixMilli()))
+
+	_, err := c.clientConn.Write(b)
 	return err
 }
 
@@ -810,9 +1037,13 @@ func (c *DTLSConn) msgAVLogin(magic uint16, size int, flags uint16, randomID []b
 	binary.LittleEndian.PutUint16(b[18:], flags)
 	copy(b[20:], randomID[:4])
 	copy(b[24:], "admin")                               // username
-	copy(b[280:], c.enr)                                // password/ENR
-	binary.LittleEndian.PutUint32(b[540:], 4)           // security_mode ?
-	binary.LittleEndian.PutUint32(b[552:], defaultCaps) // capabilities
+	// The SDK uses two 257-byte credential fields, not 256-byte fields.
+	copy(b[281:538], c.enr)
+	binary.LittleEndian.PutUint32(b[538:], 1)
+	binary.LittleEndian.PutUint32(b[542:], 4)
+	binary.LittleEndian.PutUint32(b[546:], defaultCaps)
+	binary.LittleEndian.PutUint16(b[560:], 3)
+	binary.LittleEndian.PutUint32(b[566:], 1)
 	return b
 }
 
@@ -832,7 +1063,7 @@ func (c *DTLSConn) msgAVLoginResponse(checksum uint32) []byte {
 	return b
 }
 
-func (c *DTLSConn) msgAudioFrame(payload []byte, timestampUS uint32, codec byte, sampleRate uint32, channels uint8) []byte {
+func (c *DTLSConn) msgAudioFrameLegacy(payload []byte, timestampUS uint32, codec byte, sampleRate uint32, channels uint8) []byte {
 	c.audioSeq++
 	c.audioFrameNo++
 	prevFrame := uint32(0)
@@ -840,7 +1071,11 @@ func (c *DTLSConn) msgAudioFrame(payload []byte, timestampUS uint32, codec byte,
 		prevFrame = c.audioFrameNo - 1
 	}
 
-	totalPayload := len(payload) + 16 // payload + frameinfo
+	// The receive path in pkg/tutk/frame.go strips a 40-byte frameInfo for
+	// audio EndSingle frames. Send the full 40 bytes to match (fields 16..39
+	// stay zero for audio).
+	const fiLen = 40
+	totalPayload := len(payload) + fiLen
 	b := make([]byte, 36+totalPayload)
 
 	// Outer header (36 bytes)
@@ -874,7 +1109,10 @@ func (c *DTLSConn) msgAudioFrame(payload []byte, timestampUS uint32, codec byte,
 	if channels == 2 {
 		fi[2] |= 0x01
 	}
-	fi[4] = 1 // online
+	// Android app's AVFrame.parseFrameInfo (AVIOCTRLDEFs.java:374) passes
+	// cam_index=0, onlineNum=0; the [5..11] gap stays zero. Match it exactly.
+	fi[3] = 0 // cam_index
+	fi[4] = 0 // onlineNum
 	binary.LittleEndian.PutUint32(fi[12:], (c.audioFrameNo-1)*tutk.GetSamplesPerFrame(codec)*1000/sampleRate)
 	return b
 }
@@ -882,7 +1120,10 @@ func (c *DTLSConn) msgAudioFrame(payload []byte, timestampUS uint32, codec byte,
 func (c *DTLSConn) msgTxData(payload []byte, channel byte) []byte {
 	bodySize := 12 + len(payload)
 	b := make([]byte, 16+bodySize)
-	copy(b, "\x04\x02\x1a\x0b")                            // marker + mode=data
+	// marker + mode=data; use the camera-reported protocol version at byte 2
+	// (0x1a for Wyze, 0x1d for CAM720) so the firmware recognises the frame.
+	// CAM720 firmware uses version 0x1d. Upstream Wyze code used 0x1a.
+	copy(b, []byte{0x04, 0x02, 0x1d, 0x0b})
 	binary.LittleEndian.PutUint16(b[4:], uint16(bodySize)) // body size
 	binary.LittleEndian.PutUint16(b[6:], c.seq)            // sequence
 	c.seq++
@@ -919,8 +1160,7 @@ func (c *DTLSConn) msgACK() []byte {
 	b := make([]byte, 24)
 	binary.LittleEndian.PutUint16(b[0:], magicACK)     // 0x0009
 	binary.LittleEndian.PutUint16(b[2:], protoVersion) // 0x000c
-	binary.LittleEndian.PutUint32(b[4:], c.avSeq)      // TX seq
-	c.avSeq++
+	binary.LittleEndian.PutUint32(b[4:], atomic.AddUint32(&c.avSeq, 1)-1) // TX seq
 	binary.LittleEndian.PutUint16(b[8:], c.rxSeqStart) // RX start (last acked)
 	binary.LittleEndian.PutUint16(b[10:], c.rxSeqEnd)  // RX end (highest received)
 	if c.rxSeqInit {
@@ -949,8 +1189,7 @@ func (c *DTLSConn) msgIOCtrl(payload []byte) []byte {
 	b := make([]byte, 40+len(payload))
 	binary.LittleEndian.PutUint16(b, protoVersion)     // magic
 	binary.LittleEndian.PutUint16(b[2:], protoVersion) // version
-	binary.LittleEndian.PutUint32(b[4:], c.avSeq)      // av seq
-	c.avSeq++
+	binary.LittleEndian.PutUint32(b[4:], atomic.AddUint32(&c.avSeq, 1)-1) // AV seq
 	binary.LittleEndian.PutUint16(b[16:], magicIOCtrl)            // 0x7000
 	binary.LittleEndian.PutUint16(b[18:], c.seqCmd)               // sub channel
 	binary.LittleEndian.PutUint32(b[20:], 1)                      // ioctl seq
@@ -984,4 +1223,42 @@ func hexDump(data []byte) string {
 		result += fmt.Sprintf("    ... (truncated, showing %d of %d bytes)\n", maxBytes, totalLen)
 	}
 	return result
+}
+
+// Talk-back as sent by the official Jooan iOS app (decrypted capture,
+// captures/phone_talk.pcap): IOCtrl 848 {channel=1} starts, 849 {1} stops,
+// audio is G.711 A-law, 160 bytes per 10 ms, as AV frames on channel 0.
+
+// WriteIOCtrlAV is retained for the capture replay driver.
+func (c *DTLSConn) WriteIOCtrlAV(ctrlType uint32, data []byte) error {
+	return c.WriteIOCtrlStd(ctrlType, data)
+}
+
+// SendAudioAV sends captured-profile A-law on channel 0. The old check
+// argument is ignored: the checksum is now calculated from the actual bytes.
+func (c *DTLSConn) SendAudioAV(alaw []byte, _ uint16, tsMS uint32) error {
+	c.mu.Lock()
+	conn := c.clientConn
+	if conn == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("client conn not ready")
+	}
+	b := c.msgAudioFrameMS(alaw, tsMS, tutk.CodecPCMA, 16000, 1)
+	c.mu.Unlock()
+	_, err := conn.Write(b)
+	return err
+}
+
+// ReplayAV resends a captured plaintext frame with only the AV seq rewritten.
+func (c *DTLSConn) ReplayAV(frame []byte) error {
+	if len(frame) < 8 { return fmt.Errorf("short AV frame") }
+	c.mu.Lock()
+	seq := atomic.AddUint32(&c.avSeq, 1)-1
+	conn := c.clientConn
+	c.mu.Unlock()
+	if conn == nil { return fmt.Errorf("client conn not ready") }
+	b := append([]byte{}, frame...)
+	binary.LittleEndian.PutUint32(b[4:], seq)
+	_, err := conn.Write(b)
+	return err
 }
