@@ -1,0 +1,11 @@
+# Local two-way talk to a Jooan CAM720. Values come from /etc/go2rtc-cam720.env.
+api:
+  listen: "127.0.0.1:1985"
+rtsp:
+  listen: ":8556"
+webrtc:
+  listen: ":8557"
+log:
+  level: warn
+streams:
+  cam720: cam720://${CAM720_IP}/${CAM720_UID}?token=${CAM720_TOKEN}

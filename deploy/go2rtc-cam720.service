@@ -1,0 +1,15 @@
+[Unit]
+Description=go2rtc (CAM720 fork) for two-way talk to a Jooan camera
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/go2rtc-cam720.env
+ExecStart=/usr/local/bin/go2rtc-cam720 -c /etc/go2rtc-cam720.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
