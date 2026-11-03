@@ -34,6 +34,7 @@ type Client struct {
 	audioMu      sync.Mutex
 	audioStarted bool
 	audioFrames  audioPacketizer
+	lastAudio    time.Time
 
 	closed  bool
 	closeMu sync.Mutex
@@ -174,6 +175,15 @@ func (c *Client) WriteAudio(codec byte, payload []byte, ts uint32, rate uint32, 
 	if codec != tutk.CodecPCMA || rate != 16000 || ch != 1 {
 		return fmt.Errorf("cam720: talk-back requires G.711 A-law, 16000 Hz, mono")
 	}
+	// The camera's speaker thread closes during silence between presses, so
+	// re-arm it (resend IOCtrl 848 and reset framing) whenever audio resumes
+	// after a gap. This keeps every press-and-hold working, not just the first.
+	now := time.Now()
+	if now.Sub(c.lastAudio) > 600*time.Millisecond {
+		_ = c.conn.OpenSpeakerCAM720()
+		c.audioFrames = audioPacketizer{}
+	}
+	c.lastAudio = now
 	for _, chunk := range c.audioFrames.append(payload, ts) {
 		if err := c.conn.AVSendAudioDataCh0(codec, chunk.payload, chunk.timestampUS, rate, ch); err != nil {
 			return err

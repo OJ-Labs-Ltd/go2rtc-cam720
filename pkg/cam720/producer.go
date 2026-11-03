@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/pcm"
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
 	"github.com/pion/rtp"
 )
@@ -24,15 +25,18 @@ func NewProducer(rawURL string) (*Producer, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The camera's talk pipe accepts G.711 A-law at 16 kHz; CAM720's own code
-	// (SMsgAVIoctrlSpeakerStart) and the RTP flow we observe for recv both pin
-	// it to those values.
-	codec := &core.Codec{Name: core.CodecPCMA, ClockRate: 16000, Channels: 1}
+	// The camera speaker wants G.711 A-law at 16 kHz. WebRTC browsers only send
+	// G.711 at 8 kHz, so we advertise 8 kHz G.711 (A-law and mu-law) here and
+	// upsample to 16 kHz A-law in AddTrack. Offering only G.711 keeps the
+	// browser off Opus, which it would otherwise prefer.
 	client.SetBackchannelCodec(tutk.CodecPCMA, 16000, 1)
 	media := &core.Media{
 		Kind:      core.KindAudio,
 		Direction: core.DirectionSendonly,
-		Codecs:    []*core.Codec{codec},
+		Codecs: []*core.Codec{
+			{Name: core.CodecPCMA, ClockRate: 8000, Channels: 1},
+			{Name: core.CodecPCMU, ClockRate: 8000, Channels: 1},
+		},
 	}
 	return &Producer{
 		Connection: core.Connection{
@@ -72,20 +76,27 @@ func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Re
 	if media.Direction != core.DirectionSendonly {
 		return fmt.Errorf("cam720: only sendonly supported, got %s", media.Direction)
 	}
-	if track.Codec.Name != core.CodecPCMA || track.Codec.ClockRate != 16000 || track.Codec.Channels != 1 {
-		return fmt.Errorf("cam720: talk-back requires PCMA/16000/1")
+	// Transcode whatever the browser sends (8 kHz A-law or mu-law) to the
+	// camera's 16 kHz A-law.
+	dst := &core.Codec{Name: core.CodecPCMA, ClockRate: 16000, Channels: 1}
+	transcode := pcm.Transcode(dst, track.Codec)
+	if transcode == nil {
+		return fmt.Errorf("cam720: cannot transcode %s to PCMA/16000", track.Codec.Name)
 	}
 	if err := p.client.StartIntercom(); err != nil {
 		return fmt.Errorf("cam720: start intercom: %w", err)
 	}
-	tutkCodec, rate, ch := p.client.GetBackchannelCodec()
 	sender := core.NewSender(media, track.Codec)
 	var ts uint32
 	sender.Handler = func(pkt *rtp.Packet) {
-		if err := p.client.WriteAudio(tutkCodec, pkt.Payload, ts, rate, ch); err == nil {
-			p.Send += len(pkt.Payload)
+		out := transcode(pkt.Payload)
+		if len(out) == 0 {
+			return
 		}
-		ts += uint32(len(pkt.Payload)) * 1000000 / rate
+		if err := p.client.WriteAudio(tutk.CodecPCMA, out, ts, 16000, 1); err == nil {
+			p.Send += len(out)
+		}
+		ts += uint32(len(out)) * 1000000 / 16000
 	}
 	sender.HandleRTP(track)
 	p.Senders = append(p.Senders, sender)
